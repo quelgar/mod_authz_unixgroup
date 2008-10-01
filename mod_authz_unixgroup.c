@@ -91,10 +91,8 @@ static const command_rec authz_unixgroup_cmds[] =
 
 static int check_unix_group(request_rec *r, const char *grouplist)
 {
-    char **p;
-    struct group *grp;
     char *user= r->user;
-    char *w, *at;
+    char *at;
 
     /* Strip @ sign and anything following it from the username.  Some
      * authentication modules, like mod_auth_kerb like appending such
@@ -107,53 +105,94 @@ static int check_unix_group(request_rec *r, const char *grouplist)
     struct passwd *pwd= getpwnam(user);
     if (pwd == NULL)
     {
-	/* No such user - forget it */
-	if (at != NULL) *at= '@';
-    	return 0;
+        /* No such user - forget it */
+        if (at != NULL) *at= '@';
+        return 0;
     }
 
+#ifdef HAVE_GETGROUPLIST
+    int num_groups = 0;
+    int grouplistresult = getgrouplist(user, pwd->pw_gid, NULL, &num_groups);
+    if (grouplistresult != -1)
+    {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+            "expected -1 from first getgrouplist, got %d", grouplistresult);
+    }
+    gid_t* user_groups = (gid_t*)apr_palloc(r->pool, num_groups*sizeof(gid_t));
+    grouplistresult = getgrouplist(user, pwd->pw_gid, user_groups, &num_groups);
     /* Loop through list of groups passed in */
     while (*grouplist != '\0')
     {
-	w= ap_getword_white(r->pool, &grouplist);
-	if (apr_isdigit(w[0]))
-	{
-	    /* Numeric group id */
-	    int gid= atoi(w);
-
-	    /* Check if it matches the user's primary group */
-	    if (gid == pwd->pw_gid)
-	    {
-		if (at != NULL) *at= '@';
-		return 1;
-	    }
-
-	    /* Get list of group members for numeric group id */
-	    grp= getgrgid(gid);
-	}
-	else
-	{
-	    /* Get gid and list of group members for group name */
-	    grp= getgrnam(w);
-	    /* Check if gid of this group matches user's primary gid */
-	    if (grp != NULL && grp->gr_gid == pwd->pw_gid)
-	    {
-		if (at != NULL) *at= '@';
-		return 1;
-	    }
-	}
-
-	/* Walk through list of members, seeing if any match user login */
-	if (grp != NULL)
-	    for (p= grp->gr_mem; *p != NULL; p++)
-	    {
-		if (!strcmp(user, *p))
-		{
-		    if (at != NULL) *at= '@';
-		    return 1;
-		}
-	    }
+        const char* const word = ap_getword_white(r->pool, &grouplist);
+        gid_t match_group;
+        if (apr_isdigit(word[0]))
+        {
+            // numeric group id 
+            match_group = atoi(word);
+        }
+        else
+        {
+            struct group* const group = getgrnam(word);
+            match_group = group == NULL ? -1 : group->gr_gid;
+        }
+        for (int i = 0; i < num_groups; i++)
+        {
+            gid_t const user_group = user_groups[i];
+            if (user_group == match_group)
+            {
+                if (at != NULL) *at= '@';
+                return 1;
+            }
+        }
     }
+#else
+    /* Loop through list of groups passed in */
+    while (*grouplist != '\0')
+    {
+        struct group *grp;
+        char* w= ap_getword_white(r->pool, &grouplist);
+        if (apr_isdigit(w[0]))
+        {
+            /* Numeric group id */
+            int gid= atoi(w);
+
+            /* Check if it matches the user's primary group */
+            if (gid == pwd->pw_gid)
+            {
+                if (at != NULL) *at= '@';
+                return 1;
+            }
+
+            /* Get list of group members for numeric group id */
+            grp= getgrgid(gid);
+        }
+        else
+        {
+            /* Get gid and list of group members for group name */
+            grp= getgrnam(w);
+            /* Check if gid of this group matches user's primary gid */
+            if (grp != NULL && grp->gr_gid == pwd->pw_gid)
+            {
+                if (at != NULL) *at= '@';
+                return 1;
+            }
+        }
+
+        /* Walk through list of members, seeing if any match user login */
+        if (grp != NULL)
+        {
+            char **p;
+            for (p= grp->gr_mem; *p != NULL; p++)
+            {
+                if (!strcmp(user, *p))
+                {
+                    if (at != NULL) *at= '@';
+                    return 1;
+                }
+            }
+        }
+    }
+#endif
 
     /* Didn't find any matches, flunk him */
     if (at != NULL) *at= '@';
